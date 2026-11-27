@@ -1,0 +1,57 @@
+name: Verify and import assignment history
+on:
+  push:
+    branches: [import-course-work]
+    paths: [.github/workflows/import.yml]
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify bundle, integrate template and run checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '7935ae515e7f18b21f80935ad1b8e3ab875f69350c52a48b0447b40adae3bd39  course.bundle' | sha256sum -c -
+          git fetch ./course.bundle 'refs/heads/*:refs/remotes/course/*'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c integration origin/main
+          git merge --allow-unrelated-histories -X theirs --no-ff course/main -m 'Integrate verified URL shortener with course template'
+          make test
+          make experiment
+          make compare
+          git diff --exit-code -- experiments
+          make serve >/tmp/shortener.log 2>&1 &
+          for attempt in {1..15}; do if curl -fsS http://localhost:8000/ >/dev/null; then break; fi; sleep 1; done
+          for mode in chain linear; do
+            for url in https://yonsei.ac.kr https://google.com; do
+              curl -fsS --data-urlencode "url=$url" "http://localhost:8000/$mode/shorten" >/dev/null
+            done
+            curl -fsS "http://localhost:8000/$mode/table" > "/tmp/$mode-table.html"
+            test "$(curl -s -o /dev/null -w '%{redirect_url}' http://localhost:8000/$mode/2)" = 'https://google.com/' || curl -si "http://localhost:8000/$mode/2" | grep -F 'Location: https://google.com'
+          done
+          grep -Fq '3번 칸 · 체인 길이 2' /tmp/chain-table.html
+          grep -Fq '방문 칸 3 → 4' /tmp/linear-table.html
+          git push --atomic origin 'HEAD:refs/heads/main' 'refs/remotes/course/develop:refs/heads/develop' 'refs/remotes/course/feature/*:refs/heads/feature/*'
+      - name: Record the completed agent work for each stage
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          titles=('Base62 인코딩' '명세 초안' '구현 계획' '테스트와 체이닝 단축기' '저장소 규칙 초안' '체이닝 적재율 실험' 'URL 단축 웹 서비스' '선형 탐지와 두 방식 비교')
+          branches=(1-base62 2-spec 3-plan 4-core 5-rules 6-experiment 7-web 8-probing)
+          for i in ${!titles[@]}; do
+            title="단계 $((i+1)) · ${titles[i]}"
+            previous=$(gh issue list --state all --limit 100 --json number,title | jq -r --arg t "$title" '.[] | select(.title == $t) | .number')
+            if test -n "$previous"; then continue; fi
+            commit=$(git rev-parse "refs/remotes/course/feature/${branches[i]}")
+            issue=$(gh issue create --title "$title" --body "로컬 에이전트 작업 기록. 이 단계의 구현과 변경 파일은 커밋 $commit 에서 확인할 수 있습니다.")
+            gh issue close "$issue" --comment "에이전트 검증 기록. 해당 커밋을 포함한 최종 상태에서 단위 테스트, 재현 실험 및 두 모드의 HTTP 시연을 실행했습니다. 학생의 직접 검토 기록은 별도로 추가할 수 있습니다."
+          done
